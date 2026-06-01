@@ -1,4 +1,5 @@
 import os
+import json
 
 import cv2
 from flask import Flask, Response, jsonify, render_template
@@ -9,6 +10,35 @@ VIDEO_PATH = os.environ.get("VIDEO_PATH", "res/Export 01-06-2026 10-18-50.MP4")
 MODEL_PATH = os.environ.get("YOLO_MODEL", "yolov8n.pt")
 RALLA_CLASS_ID = int(os.environ.get("RALLA_CLASS_ID", "0"))
 LINE_RATIO = float(os.environ.get("LINE_RATIO", "0.5"))
+CONFIDENCE = float(os.environ.get("CONFIDENCE", "0.20"))
+IMGSZ = int(os.environ.get("IMGSZ", "256 "))#da 416 default a 256 per performance migliore, ma se si vuole più precisione meglio 416 o 640  
+FRAME_STRIDE = int(os.environ.get("FRAME_STRIDE", "6"))#2 = default, metto 4 per performance migliore
+
+DEFAULT_ROI_POLYGON = [
+    (0.50, 0.50),
+    (0.71, 0.45),
+    (0.77, 0.63),
+    (0.57, 0.69),
+]
+
+ROI_POLYGON = DEFAULT_ROI_POLYGON
+roi_polygon_raw = os.environ.get("ROI_POLYGON", "")
+if roi_polygon_raw.strip():
+    try:
+        ROI_POLYGON = json.loads(roi_polygon_raw)
+    except json.JSONDecodeError:
+        ROI_POLYGON = DEFAULT_ROI_POLYGON
+
+ROTATION_ANGLE = os.environ.get("ROTATION_ANGLE", "-45")
+if ROTATION_ANGLE is not None and ROTATION_ANGLE != "":
+    try:
+        ROTATION_ANGLE = float(ROTATION_ANGLE)
+    except ValueError:
+        ROTATION_ANGLE = -45.0
+else:
+    ROTATION_ANGLE = -45.0
+
+AUTO_ROTATE = os.environ.get("AUTO_ROTATE", "false").lower() in ("1", "true", "yes")
 
 app = Flask(__name__)
 tracker = RallaTracker(
@@ -16,6 +46,12 @@ tracker = RallaTracker(
     model_path=MODEL_PATH,
     ralla_class_id=RALLA_CLASS_ID,
     line_ratio=LINE_RATIO,
+    conf=CONFIDENCE,
+    imgsz=IMGSZ,
+    rotation_angle=ROTATION_ANGLE,
+    auto_rotate=AUTO_ROTATE,
+    frame_stride=FRAME_STRIDE,
+    roi_polygon=ROI_POLYGON,
 )
 
 

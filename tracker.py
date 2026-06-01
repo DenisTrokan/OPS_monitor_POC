@@ -1,7 +1,9 @@
 import threading
-from typing import Dict, Optional
+import time
+from typing import Dict, Optional, Sequence, Tuple
 
 import cv2
+import numpy as np
 from ultralytics import YOLO
 
 
@@ -12,9 +14,13 @@ class RallaTracker:
         model_path: str = "yolov8n.pt",
         ralla_class_id: int = 0,
         line_ratio: float = 0.5,
-        conf: float = 0.25,
-        imgsz: int = 640,
+        conf: float = 0.20,
+        imgsz: int = 416,
         max_missing: int = 60,
+        rotation_angle: Optional[float] = None,
+        auto_rotate: bool = False,
+        frame_stride: int = 2,
+        roi_polygon: Optional[Sequence[Sequence[float]]] = None,
     ) -> None:
         self.video_path = video_path
         self.cap = cv2.VideoCapture(video_path)
@@ -27,42 +33,75 @@ class RallaTracker:
         self.conf = conf
         self.imgsz = imgsz
         self.max_missing = max_missing
+        self.rotation_angle = rotation_angle
+        self.auto_rotate = auto_rotate
+        self.frame_stride = max(1, int(frame_stride))
+        self.roi_polygon_raw = [tuple(point) for point in roi_polygon] if roi_polygon else None
 
-        self.line_y: Optional[int] = None
         self.imbarcati = 0
         self.sbarcati = 0
         self.last_direction = "N/D"
+        self.last_detection_count = 0
+        self.active_tracks = 0
+        self.fps = 0.0
 
         self.frame_index = 0
-        self.last_centroids: Dict[int, tuple[int, int]] = {}
         self.last_seen: Dict[int, int] = {}
+        self.track_states: Dict[int, Dict[str, object]] = {}
         self.lock = threading.Lock()
         self.frame_lock = threading.Lock()
 
     def _read_frame(self):
-        ok, frame = self.cap.read()
-        if ok:
-            return frame
+        frame = None
+        for _ in range(self.frame_stride):
+            ok, current_frame = self.cap.read()
+            if not ok:
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ok, current_frame = self.cap.read()
+                if not ok:
+                    return None
+            frame = current_frame
+        return frame
 
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        ok, frame = self.cap.read()
-        if ok:
-            return frame
+    def _resolve_roi_polygon(self, frame) -> Optional[np.ndarray]:
+        if not self.roi_polygon_raw:
+            return None
 
-        return None
+        height, width = frame.shape[:2]
+        points = np.asarray(self.roi_polygon_raw, dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] != 2 or len(points) < 3:
+            return None
+
+        if np.max(points) <= 1.5:
+            points[:, 0] *= width
+            points[:, 1] *= height
+
+        return np.round(points).astype(np.int32)
+
+    @staticmethod
+    def _point_in_roi(roi_polygon: Optional[np.ndarray], point: Tuple[int, int]) -> bool:
+        if roi_polygon is None or len(roi_polygon) < 3:
+            return True
+        return cv2.pointPolygonTest(roi_polygon, point, False) >= 0
+
+    @staticmethod
+    def _classify_side(roi_polygon: Optional[np.ndarray], x_coord: int) -> str:
+        if roi_polygon is None or len(roi_polygon) < 3:
+            return "center"
+        center_x = float(np.mean(roi_polygon[:, 0]))
+        return "right" if x_coord >= center_x else "left"
 
     def get_stats(self) -> Dict[str, object]:
         with self.lock:
-            imbarcati = self.imbarcati
-            sbarcati = self.sbarcati
-            last_direction = self.last_direction
-
-        return {
-            "imbarcati": imbarcati,
-            "sbarcati": sbarcati,
-            "totale_movimentati": imbarcati + sbarcati,
-            "ultima_direzione": last_direction,
-        }
+            return {
+                "imbarcati": self.imbarcati,
+                "sbarcati": self.sbarcati,
+                "totale_movimentati": self.imbarcati + self.sbarcati,
+                "ultima_direzione": self.last_direction,
+                "fps": round(self.fps, 2),
+                "detections_roi": self.last_detection_count,
+                "active_tracks": self.active_tracks,
+            }
 
     def process_next_frame(self):
         with self.frame_lock:
@@ -70,14 +109,34 @@ class RallaTracker:
             if frame is None:
                 return None
 
-        if self.line_y is None:
-            # Imposta la linea virtuale in base all'altezza del frame (0.0-1.0).
-            # Cambia line_ratio se il video ha una risoluzione diversa o vuoi spostarla.
-            # Se preferisci un valore in pixel, puoi usare ad esempio line_y = 540 per un video 1080p.
-            self.line_y = int(frame.shape[0] * self.line_ratio)
+        if self.rotation_angle is None and self.auto_rotate and self.frame_index == 0:
+            try:
+                estimated_angle = self._estimate_rotation_angle(frame)
+                self.rotation_angle = -estimated_angle if estimated_angle is not None else 0.0
+            except Exception:
+                self.rotation_angle = 0.0
 
+        if self.rotation_angle is not None and abs(self.rotation_angle) > 0.05:
+            frame = self._rotate_image(frame, self.rotation_angle)
+
+        roi_polygon = self._resolve_roi_polygon(frame)
+        roi_crop = frame
+        roi_offset_x = 0
+        roi_offset_y = 0
+
+        if roi_polygon is not None and len(roi_polygon) >= 3:
+            x, y, w, h = cv2.boundingRect(roi_polygon)
+            x = max(0, x)
+            y = max(0, y)
+            x2 = min(frame.shape[1], x + max(1, w))
+            y2 = min(frame.shape[0], y + max(1, h))
+            roi_crop = frame[y:y2, x:x2]
+            roi_offset_x = x
+            roi_offset_y = y
+
+        start_time = time.perf_counter()
         results = self.model.track(
-            frame,
+            roi_crop,
             persist=True,
             conf=self.conf,
             imgsz=self.imgsz,
@@ -85,11 +144,15 @@ class RallaTracker:
             tracker="bytetrack.yaml",
             verbose=False,
         )
+        elapsed = max(time.perf_counter() - start_time, 1e-6)
 
         self.frame_index += 1
         imbarco_delta = 0
         sbarco_delta = 0
+        detections_in_roi = 0
+        active_tracks = 0
         last_direction = None
+
         if results and len(results) > 0:
             boxes = results[0].boxes
             if boxes is not None and boxes.xyxy is not None:
@@ -103,34 +166,68 @@ class RallaTracker:
                 elif ids is None:
                     ids = [None] * len(xyxy)
 
-                for (x1, y1, x2, y2), track_id in zip(xyxy, ids):
-                    cx = int((x1 + x2) / 2)
-                    cy = int((y1 + y2) / 2)
+                confs = boxes.conf
+                if confs is not None and hasattr(confs, "cpu"):
+                    confs = confs.cpu().numpy()
+                elif confs is None:
+                    confs = [None] * len(xyxy)
+
+                for (x1, y1, x2, y2), track_id, confidence in zip(xyxy, ids, confs):
+                    x1_full = int(float(x1) + roi_offset_x)
+                    y1_full = int(float(y1) + roi_offset_y)
+                    x2_full = int(float(x2) + roi_offset_x)
+                    y2_full = int(float(y2) + roi_offset_y)
+                    cx = int((x1_full + x2_full) / 2)
+                    cy = int((y1_full + y2_full) / 2)
+
+                    inside_roi = self._point_in_roi(roi_polygon, (cx, cy))
+                    if inside_roi:
+                        detections_in_roi += 1
 
                     label = "Ralla"
+                    box_color = (46, 204, 113) if inside_roi else (120, 120, 120)
+
                     if track_id is not None:
                         track_id = int(track_id)
+                        active_tracks += 1
                         label = f"Ralla #{track_id}"
 
-                        prev = self.last_centroids.get(track_id)
-                        if prev is not None:
-                            prev_y = prev[1]
-                            if prev_y < self.line_y <= cy:
-                                sbarco_delta += 1
-                                last_direction = "Sbarco"
-                            elif prev_y > self.line_y >= cy:
-                                imbarco_delta += 1
-                                last_direction = "Imbarco"
+                        state = self.track_states.setdefault(
+                            track_id,
+                            {
+                                "inside_roi": False,
+                                "entry_x": None,
+                                "last_centroid": None,
+                            },
+                        )
 
-                        self.last_centroids[track_id] = (cx, cy)
+                        state["last_centroid"] = (cx, cy)
                         self.last_seen[track_id] = self.frame_index
 
-                    cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (46, 204, 113), 2)
-                    cv2.circle(frame, (cx, cy), 3, (46, 204, 113), -1)
+                        if inside_roi and not state["inside_roi"]:
+                            state["inside_roi"] = True
+                            state["entry_x"] = cx
+                        elif not inside_roi and state["inside_roi"] and state["entry_x"] is not None:
+                            entry_x = float(state["entry_x"])
+                            if cx < entry_x:
+                                sbarco_delta += 1
+                                last_direction = "Sbarco"
+                            else:
+                                imbarco_delta += 1
+                                last_direction = "Imbarco"
+                            state["inside_roi"] = False
+                            state["entry_x"] = None
+
+                    cv2.rectangle(frame, (x1_full, y1_full), (x2_full, y2_full), box_color, 2)
+                    cv2.circle(frame, (cx, cy), 3, box_color, -1)
+
+                    label_text = label
+                    if confidence is not None:
+                        label_text = f"{label} {float(confidence):.2f}"
                     cv2.putText(
                         frame,
-                        label,
-                        (int(x1), max(20, int(y1) - 8)),
+                        label_text,
+                        (x1_full, max(20, y1_full - 8)),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.55,
                         (235, 245, 255),
@@ -144,26 +241,37 @@ class RallaTracker:
         ]
         for track_id in stale_ids:
             self.last_seen.pop(track_id, None)
-            self.last_centroids.pop(track_id, None)
+            self.track_states.pop(track_id, None)
 
         with self.lock:
-            base_imbarcati = self.imbarcati
-            base_sbarcati = self.sbarcati
-            base_direction = self.last_direction
-
-        display_imbarcati = base_imbarcati + imbarco_delta
-        display_sbarcati = base_sbarcati + sbarco_delta
-        display_total = display_imbarcati + display_sbarcati
-        display_direction = last_direction or base_direction
-
-        if imbarco_delta or sbarco_delta or last_direction:
-            with self.lock:
+            if imbarco_delta or sbarco_delta or last_direction:
                 self.imbarcati += imbarco_delta
                 self.sbarcati += sbarco_delta
                 if last_direction:
                     self.last_direction = last_direction
 
-        self._draw_overlay(frame, display_imbarcati, display_sbarcati, display_total, display_direction)
+            self.fps = 1.0 / elapsed
+            self.last_detection_count = detections_in_roi
+            self.active_tracks = active_tracks
+            display_imbarcati = self.imbarcati
+            display_sbarcati = self.sbarcati
+            display_total = self.imbarcati + self.sbarcati
+            display_direction = self.last_direction
+            display_fps = self.fps
+            display_detections = self.last_detection_count
+            display_tracks = self.active_tracks
+
+        self._draw_overlay(
+            frame,
+            display_imbarcati,
+            display_sbarcati,
+            display_total,
+            display_direction,
+            roi_polygon,
+            display_fps,
+            display_detections,
+            display_tracks,
+        )
         return frame
 
     def _draw_overlay(
@@ -173,55 +281,53 @@ class RallaTracker:
         sbarcati: int,
         totale: int,
         last_direction: str,
+        roi_polygon: Optional[np.ndarray],
+        fps: float,
+        detections_in_roi: int,
+        active_tracks: int,
     ) -> None:
-        h, w = frame.shape[:2]
-        line_y = self.line_y if self.line_y is not None else int(h * 0.5)
-
-        cv2.line(frame, (0, line_y), (w, line_y), (0, 200, 255), 2)
+        if roi_polygon is not None and len(roi_polygon) >= 3:
+            overlay = frame.copy()
+            cv2.fillPoly(overlay, [roi_polygon], (0, 0, 255))
+            frame[:] = cv2.addWeighted(overlay, 0.12, frame, 0.88, 0)
+            cv2.polylines(frame, [roi_polygon], True, (0, 0, 255), 3)
+            roi_text_x = int(np.min(roi_polygon[:, 0]))
+            roi_text_y = max(24, int(np.min(roi_polygon[:, 1])) - 10)
+            cv2.putText(frame, "ZONA CONTEGGIO", (roi_text_x, roi_text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2)
 
         panel_x, panel_y = 16, 14
-        panel_w, panel_h = 360, 110
-        cv2.rectangle(
-            frame,
-            (panel_x, panel_y),
-            (panel_x + panel_w, panel_y + panel_h),
-            (18, 20, 26),
-            -1,
-        )
+        panel_w, panel_h = 430, 124
+        cv2.rectangle(frame, (panel_x, panel_y), (panel_x + panel_w, panel_y + panel_h), (18, 20, 26), -1)
 
-        cv2.putText(
-            frame,
-            f"Imbarcati: {imbarcati}",
-            (panel_x + 12, panel_y + 32),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (236, 243, 255),
-            2,
-        )
-        cv2.putText(
-            frame,
-            f"Sbarcati: {sbarcati}",
-            (panel_x + 12, panel_y + 58),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (236, 243, 255),
-            2,
-        )
-        cv2.putText(
-            frame,
-            f"Totale: {totale}",
-            (panel_x + 12, panel_y + 84),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (236, 243, 255),
-            2,
-        )
-        cv2.putText(
-            frame,
-            f"Ultima: {last_direction}",
-            (panel_x + 180, panel_y + 84),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (120, 214, 255),
-            2,
-        )
+        cv2.putText(frame, f"Imbarcati: {imbarcati}", (panel_x + 12, panel_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (236, 243, 255), 2)
+        cv2.putText(frame, f"Sbarcati: {sbarcati}", (panel_x + 12, panel_y + 58), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (236, 243, 255), 2)
+        cv2.putText(frame, f"Totale: {totale}", (panel_x + 12, panel_y + 86), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (236, 243, 255), 2)
+        cv2.putText(frame, f"Ultima: {last_direction}", (panel_x + 12, panel_y + 112), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (120, 214, 255), 2)
+
+        status_x = max(12, frame.shape[1] - 300)
+        status_y = 18
+        cv2.rectangle(frame, (status_x, status_y), (frame.shape[1] - 16, status_y + 116), (18, 20, 26), -1)
+        cv2.putText(frame, f"FPS: {fps:.1f}", (status_x + 12, status_y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(frame, f"Det in ROI: {detections_in_roi}", (status_x + 12, status_y + 56), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2)
+        cv2.putText(frame, f"Tracks: {active_tracks}", (status_x + 12, status_y + 82), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2)
+        cv2.putText(frame, f"Conf: {self.conf:.2f}", (status_x + 12, status_y + 108), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (255, 230, 140), 2)
+
+    def _rotate_image(self, image, angle_deg: float):
+        height, width = image.shape[:2]
+        matrix = cv2.getRotationMatrix2D((width / 2, height / 2), angle_deg, 1.0)
+        return cv2.warpAffine(image, matrix, (width, height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+    def _estimate_rotation_angle(self, frame, debug: bool = False) -> float:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 50, 150)
+        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=80, minLineLength=80, maxLineGap=20)
+        angles = []
+        if lines is not None:
+            for x1, y1, x2, y2 in lines[:, 0]:
+                angle = float(np.degrees(np.arctan2((y2 - y1), (x2 - x1))))
+                if abs(angle) < 45:
+                    angles.append(angle)
+
+        if not angles:
+            return 0.0
+        return float(np.median(angles))
