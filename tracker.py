@@ -184,6 +184,11 @@ class RallaTracker:
                     if inside_roi:
                         detections_in_roi += 1
 
+                    # median X of ROI for debug/side classification
+                    roi_center_x = None
+                    if roi_polygon is not None and len(roi_polygon) >= 3:
+                        roi_center_x = int(float(np.mean(roi_polygon[:, 0])))
+
                     label = "Ralla"
                     box_color = (46, 204, 113) if inside_roi else (120, 120, 120)
 
@@ -233,6 +238,21 @@ class RallaTracker:
                         (235, 245, 255),
                         2,
                     )
+
+                    # Debug overlay: show entry/exit side near the box
+                    try:
+                        state_dbg = self.track_states.get(track_id)
+                        dbg_text = ""
+                        if state_dbg is not None:
+                            entry_x = state_dbg.get("entry_x")
+                            if entry_x is not None and roi_center_x is not None:
+                                entry_side = "R" if entry_x >= roi_center_x else "L"
+                                exit_side = "R" if cx >= roi_center_x else "L"
+                                dbg_text = f"E:{entry_side}->X:{exit_side}"
+                        if dbg_text:
+                            cv2.putText(frame, dbg_text, (x1_full, min(frame.shape[0]-6, y2_full + 18)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 220, 100), 2)
+                    except Exception:
+                        pass
 
         stale_ids = [
             track_id
@@ -294,6 +314,15 @@ class RallaTracker:
             roi_text_x = int(np.min(roi_polygon[:, 0]))
             roi_text_y = max(24, int(np.min(roi_polygon[:, 1])) - 10)
             cv2.putText(frame, "ZONA CONTEGGIO", (roi_text_x, roi_text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2)
+            # draw ROI median X line for diagnostics
+            try:
+                roi_cx = int(float(np.mean(roi_polygon[:, 0])))
+                y_min = int(np.min(roi_polygon[:, 1]))
+                y_max = int(np.max(roi_polygon[:, 1]))
+                cv2.line(frame, (roi_cx, y_min), (roi_cx, y_max), (255, 220, 100), 2)
+                cv2.putText(frame, "MID", (roi_cx + 6, max(18, y_min + 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 220, 100), 2)
+            except Exception:
+                pass
 
         panel_x, panel_y = 16, 14
         panel_w, panel_h = 430, 124
