@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Ro-Ro Ops Monitor</title>
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+        <link
+            href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500;600&display=swap"
+            rel="stylesheet"
+        />
+        <script>
+            tailwind = {
+                config: {
+                    theme: {
+                        extend: {
+                            fontFamily: {
+                                sans: ["'Space Grotesk'", "sans-serif"],
+                                mono: ["'IBM Plex Mono'", "monospace"],
+                            },
+                            colors: {
+                                ink: "#0b1117",
+                                panel: "#131a22",
+                                accent: "#22d3ee",
+                                ember: "#f59e0b",
+                                signal: "#34d399",
+                            },
+                        },
+                    },
+                },
+            };
+        </script>
+        <script src="https://cdn.tailwindcss.com"></script>
+        <style>
+            :root {
+                color-scheme: dark;
+            }
+        </style>
+    </head>
+    <body class="bg-ink text-slate-100 font-sans">
+        <div class="pointer-events-none fixed inset-0 -z-10 overflow-hidden">
+            <div class="absolute -top-32 -left-24 h-96 w-96 rounded-full bg-accent/15 blur-3xl"></div>
+            <div class="absolute bottom-0 right-0 h-[34rem] w-[34rem] rounded-full bg-ember/10 blur-3xl"></div>
+            <div
+                class="absolute inset-0 bg-[radial-gradient(circle_at_top,_rgba(56,189,248,0.08),_transparent_55%)]"
+            ></div>
+        </div>
+
+        <main class="mx-auto flex min-h-screen max-w-6xl flex-col gap-6 px-6 py-10">
+            <header class="flex flex-wrap items-center justify-between gap-4">
+                <div>
+                    <p class="text-xs uppercase tracking-[0.3em] text-slate-400">Ro-Ro Terminal</p>
+                    <h1 class="text-3xl font-semibold text-white">Ops Monitoring Dashboard</h1>
+                </div>
+                <div class="flex items-center gap-3 rounded-full bg-panel/70 px-4 py-2 text-sm text-slate-200">
+                    <span class="relative flex h-2.5 w-2.5">
+                        <span class="absolute inline-flex h-full w-full animate-ping rounded-full bg-signal/60"></span>
+                        <span class="relative inline-flex h-2.5 w-2.5 rounded-full bg-signal"></span>
+                    </span>
+                    <span>Live processing</span>
+                </div>
+            </header>
+
+            <section class="grid gap-6 lg:grid-cols-[2.1fr_1fr]">
+                <div class="rounded-3xl border border-white/10 bg-panel/70 p-4 shadow-xl">
+                    <div class="flex items-center justify-between px-2 pb-4">
+                        <div>
+                            <h2 class="text-lg font-semibold">Video stream</h2>
+                            <p class="text-sm text-slate-400">Analisi con YOLOv8 + tracking</p>
+                        </div>
+                        <div class="text-xs font-mono text-slate-400">/video_feed</div>
+                    </div>
+                    <div class="overflow-hidden rounded-2xl border border-white/10 bg-black">
+                        <img
+                            id="video-stream"
+                            src="/video_feed"
+                            alt="Video stream"
+                            class="h-full w-full object-cover"
+                        />
+                    </div>
+                </div>
+
+                <div class="flex flex-col gap-4">
+                    <div class="rounded-3xl border border-white/10 bg-panel/70 p-5 shadow-xl">
+                        <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Imbarcati</p>
+                        <p id="kpi-imbarcati" class="mt-3 text-4xl font-semibold text-white">0</p>
+                        <p class="mt-2 text-xs text-slate-400">Movimenti verso la nave</p>
+                    </div>
+                    <div class="rounded-3xl border border-white/10 bg-panel/70 p-5 shadow-xl">
+                        <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Sbarcati</p>
+                        <p id="kpi-sbarcati" class="mt-3 text-4xl font-semibold text-white">0</p>
+                        <p class="mt-2 text-xs text-slate-400">Movimenti verso il piazzale</p>
+                    </div>
+                    <div class="rounded-3xl border border-white/10 bg-panel/70 p-5 shadow-xl">
+                        <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Ultima direzione</p>
+                        <p id="kpi-direzione" class="mt-3 text-2xl font-semibold text-accent">N/D</p>
+                        <div class="mt-4 flex items-center justify-between text-xs text-slate-400">
+                            <span>Totale movimentati</span>
+                            <span id="kpi-totale" class="font-mono text-slate-200">0</span>
+                        </div>
+                    </div>
+
+                    <div class="rounded-3xl border border-white/10 bg-panel/50 p-5 text-sm text-slate-300">
+                        <div class="flex items-center justify-between">
+                            <span>Status API</span>
+                            <span id="api-status" class="text-emerald-300">Online</span>
+                        </div>
+                        <p class="mt-3 text-xs text-slate-400">
+                            Aggiornamento ogni 1s da <span class="font-mono">/api/stats</span>
+                        </p>
+                    </div>
+                </div>
+            </section>
+        </main>
+
+        <script>
+            const kpiImbarcati = document.getElementById("kpi-imbarcati");
+            const kpiSbarcati = document.getElementById("kpi-sbarcati");
+            const kpiDirezione = document.getElementById("kpi-direzione");
+            const kpiTotale = document.getElementById("kpi-totale");
+            const apiStatus = document.getElementById("api-status");
+
+            async function refreshStats() {
+                try {
+                    const response = await fetch("/api/stats", { cache: "no-store" });
+                    const data = await response.json();
+                    kpiImbarcati.textContent = data.imbarcati ?? 0;
+                    kpiSbarcati.textContent = data.sbarcati ?? 0;
+                    kpiTotale.textContent = data.totale_movimentati ?? 0;
+                    kpiDirezione.textContent = data.ultima_direzione ?? "N/D";
+                    apiStatus.textContent = "Online";
+                    apiStatus.classList.remove("text-rose-300");
+                    apiStatus.classList.add("text-emerald-300");
+                } catch (error) {
+                    apiStatus.textContent = "Offline";
+                    apiStatus.classList.remove("text-emerald-300");
+                    apiStatus.classList.add("text-rose-300");
+                }
+            }
+
+            refreshStats();
+            setInterval(refreshStats, 1000);
+        </script>
+    </body>
+</html>

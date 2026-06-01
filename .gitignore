@@ -3,6 +3,9 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Project assets (do not commit video resources)
+res/
+
 # C extensions
 *.so
 
