@@ -8,7 +8,7 @@ from tracker import RallaTracker
 
 VIDEO_PATH = os.environ.get("VIDEO_PATH", "res/Export 01-06-2026 10-18-50.MP4")
 MODEL_PATH = os.environ.get("YOLO_MODEL", "yolov8n.pt")
-RALLA_CLASS_ID = int(os.environ.get("RALLA_CLASS_ID", "0"))
+RALLA_CLASS_ID = int(os.environ.get("RALLA_CLASS_ID", "2"))
 LINE_RATIO = float(os.environ.get("LINE_RATIO", "0.5"))
 CONFIDENCE = float(os.environ.get("CONFIDENCE", "0.20"))
 IMGSZ = int(os.environ.get("IMGSZ", "256 "))#da 416 default a 256 per performance migliore, ma se si vuole più precisione meglio 416 o 640  
