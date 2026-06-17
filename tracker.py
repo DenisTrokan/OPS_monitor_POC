@@ -21,6 +21,8 @@ class RallaTracker:
         auto_rotate: bool = False,
         frame_stride: int = 2,
         roi_polygon: Optional[Sequence[Sequence[float]]] = None,
+        mode: str = "tugs",
+        world_classes: Optional[list] = None,
     ) -> None:
         self.video_path = video_path
         self.cap = cv2.VideoCapture(video_path)
@@ -37,9 +39,18 @@ class RallaTracker:
         self.auto_rotate = auto_rotate
         self.frame_stride = max(1, int(frame_stride))
         self.roi_polygon_raw = [tuple(point) for point in roi_polygon] if roi_polygon else None
+        self.mode = mode
+        
+        if world_classes and ("world" in model_path.lower() or "world" in str(type(self.model.model)).lower()):
+            try:
+                self.model.set_classes(world_classes)
+            except Exception as e:
+                print(f"Warning: set_classes failed: {e}")
 
         self.imbarcati = 0
         self.sbarcati = 0
+        self.current_con_dpi = 0
+        self.current_senza_dpi = 0
         self.last_direction = "N/D"
         self.last_detection_count = 0
         self.active_tracks = 0
@@ -93,15 +104,40 @@ class RallaTracker:
 
     def get_stats(self) -> Dict[str, object]:
         with self.lock:
-            return {
-                "imbarcati": self.imbarcati,
-                "sbarcati": self.sbarcati,
-                "totale_movimentati": self.imbarcati + self.sbarcati,
-                "ultima_direzione": self.last_direction,
+            stats = {
+                "mode": self.mode,
                 "fps": round(self.fps, 2),
                 "detections_roi": self.last_detection_count,
                 "active_tracks": self.active_tracks,
             }
+            if self.mode == "dpi":
+                stats["con_dpi"] = self.current_con_dpi
+                stats["senza_dpi"] = self.current_senza_dpi
+                stats["totale"] = self.current_con_dpi + self.current_senza_dpi
+            else:
+                stats["imbarcati"] = self.imbarcati
+                stats["sbarcati"] = self.sbarcati
+                stats["totale_movimentati"] = self.imbarcati + self.sbarcati
+                stats["ultima_direzione"] = self.last_direction
+            return stats
+
+    def reset_counters(self) -> None:
+        with self.lock:
+            self.imbarcati = 0
+            self.sbarcati = 0
+            self.current_con_dpi = 0
+            self.current_senza_dpi = 0
+            self.last_direction = "N/D"
+            self.last_detection_count = 0
+            self.active_tracks = 0
+            self.fps = 0.0
+
+        with self.frame_lock:
+            self.frame_index = 0
+            self.last_seen.clear()
+            self.track_states.clear()
+            if self.cap.isOpened():
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     def process_next_frame(self):
         with self.frame_lock:
@@ -120,6 +156,8 @@ class RallaTracker:
             frame = self._rotate_image(frame, self.rotation_angle)
 
         roi_polygon = self._resolve_roi_polygon(frame)
+        if self.mode == "dpi":
+            roi_polygon = None
         roi_crop = frame
         roi_offset_x = 0
         roi_offset_y = 0
@@ -140,7 +178,7 @@ class RallaTracker:
             persist=True,
             conf=self.conf,
             imgsz=self.imgsz,
-            classes=[self.ralla_class_id],
+            classes=[self.ralla_class_id] if self.mode == "tugs" else None,
             tracker="bytetrack.yaml",
             verbose=False,
         )
@@ -149,6 +187,8 @@ class RallaTracker:
         self.frame_index += 1
         imbarco_delta = 0
         sbarco_delta = 0
+        con_dpi_count = 0
+        senza_dpi_count = 0
         detections_in_roi = 0
         active_tracks = 0
         last_direction = None
@@ -172,87 +212,140 @@ class RallaTracker:
                 elif confs is None:
                     confs = [None] * len(xyxy)
 
-                for (x1, y1, x2, y2), track_id, confidence in zip(xyxy, ids, confs):
-                    x1_full = int(float(x1) + roi_offset_x)
-                    y1_full = int(float(y1) + roi_offset_y)
-                    x2_full = int(float(x2) + roi_offset_x)
-                    y2_full = int(float(y2) + roi_offset_y)
-                    cx = int((x1_full + x2_full) / 2)
-                    cy = int((y1_full + y2_full) / 2)
+                clss = boxes.cls
+                if clss is not None and hasattr(clss, "cpu"):
+                    clss = clss.cpu().numpy().astype(int)
+                elif clss is None:
+                    clss = [0] * len(xyxy)
 
-                    inside_roi = self._point_in_roi(roi_polygon, (cx, cy))
-                    if inside_roi:
-                        detections_in_roi += 1
+                if self.mode == "dpi":
+                    people = []
+                    vests = []
+                    for (x1, y1, x2, y2), track_id, confidence, cls_id in zip(xyxy, ids, confs, clss):
+                        if cls_id == 0:
+                            people.append((x1, y1, x2, y2, confidence, track_id))
+                        elif cls_id == 1:
+                            vests.append((x1, y1, x2, y2, confidence))
+                    
+                    for px1, py1, px2, py2, pconf, track_id in people:
+                        has_vest = False
+                        for vx1, vy1, vx2, vy2, vconf in vests:
+                            vcx = (vx1 + vx2) / 2
+                            vcy = (vy1 + vy2) / 2
+                            if px1 <= vcx <= px2 and py1 <= vcy <= py2:
+                                has_vest = True
+                                break
+                        
+                        x1_full = int(float(px1) + roi_offset_x)
+                        y1_full = int(float(py1) + roi_offset_y)
+                        x2_full = int(float(px2) + roi_offset_x)
+                        y2_full = int(float(py2) + roi_offset_y)
+                        cx = int((x1_full + x2_full) / 2)
+                        cy = int((y1_full + y2_full) / 2)
+                        
+                        if track_id is not None:
+                            self.last_seen[int(track_id)] = self.frame_index
+                            active_tracks += 1
+                        
+                        inside_roi = self._point_in_roi(roi_polygon, (cx, cy))
+                        if inside_roi:
+                            detections_in_roi += 1
 
-                    # median X of ROI for debug/side classification
-                    roi_center_x = None
-                    if roi_polygon is not None and len(roi_polygon) >= 3:
-                        roi_center_x = int(float(np.mean(roi_polygon[:, 0])))
+                        if has_vest:
+                            con_dpi_count += 1
+                            box_color = (0, 200, 0)
+                            label = "DPI OK"
+                        else:
+                            senza_dpi_count += 1
+                            box_color = (0, 0, 255)
+                            label = "NO DPI"
+                        
+                        cv2.rectangle(frame, (x1_full, y1_full), (x2_full, y2_full), box_color, 2)
+                        cv2.putText(frame, f"{label} {float(pconf):.2f}", (x1_full, max(20, y1_full - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, box_color, 2)
 
-                    label = "Ralla"
-                    box_color = (46, 204, 113) if inside_roi else (120, 120, 120)
-
-                    if track_id is not None:
-                        track_id = int(track_id)
-                        active_tracks += 1
-                        label = f"Ralla #{track_id}"
-
-                        state = self.track_states.setdefault(
-                            track_id,
-                            {
-                                "inside_roi": False,
-                                "entry_x": None,
-                                "last_centroid": None,
-                            },
+                else:
+                    for (x1, y1, x2, y2), track_id, confidence in zip(xyxy, ids, confs):
+                        x1_full = int(float(x1) + roi_offset_x)
+                        y1_full = int(float(y1) + roi_offset_y)
+                        x2_full = int(float(x2) + roi_offset_x)
+                        y2_full = int(float(y2) + roi_offset_y)
+                        cx = int((x1_full + x2_full) / 2)
+                        cy = int((y1_full + y2_full) / 2)
+    
+                        inside_roi = self._point_in_roi(roi_polygon, (cx, cy))
+                        if inside_roi:
+                            detections_in_roi += 1
+    
+                        # median X of ROI for debug/side classification
+                        roi_center_x = None
+                        if roi_polygon is not None and len(roi_polygon) >= 3:
+                            roi_center_x = int(float(np.mean(roi_polygon[:, 0])))
+    
+                        label = "Ralla"
+                        box_color = (46, 204, 113) if inside_roi else (120, 120, 120)
+    
+                        if track_id is not None:
+                            track_id = int(track_id)
+                            active_tracks += 1
+                            label = f"Ralla #{track_id}"
+    
+                            state = self.track_states.setdefault(
+                                track_id,
+                                {
+                                    "inside_roi": False,
+                                    "entry_x": None,
+                                    "last_centroid": None,
+                                },
+                            )
+    
+                            state["last_centroid"] = (cx, cy)
+                            self.last_seen[track_id] = self.frame_index
+    
+                            if inside_roi and not state["inside_roi"]:
+                                state["inside_roi"] = True
+                                state["entry_x"] = cx
+                            elif not inside_roi and state["inside_roi"] and state["entry_x"] is not None:
+                                entry_x = float(state["entry_x"])
+                                if cx < entry_x:
+                                    sbarco_delta += 1
+                                    last_direction = "Sbarco"
+                                else:
+                                    imbarco_delta += 1
+                                    last_direction = "Imbarco"
+                                state["inside_roi"] = False
+                                state["entry_x"] = None
+    
+                        cv2.rectangle(frame, (x1_full, y1_full), (x2_full, y2_full), box_color, 2)
+                        cv2.circle(frame, (cx, cy), 3, box_color, -1)
+    
+                        label_text = label
+                        if confidence is not None:
+                            label_text = f"{label} {float(confidence):.2f}"
+                        cv2.putText(
+                            frame,
+                            label_text,
+                            (x1_full, max(20, y1_full - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55,
+                            (235, 245, 255),
+                            2,
                         )
+    
+                        # Debug overlay: show entry/exit side near the box
+                        try:
+                            state_dbg = self.track_states.get(track_id)
+                            dbg_text = ""
+                            if state_dbg is not None:
+                                entry_x = state_dbg.get("entry_x")
+                                if entry_x is not None and roi_center_x is not None:
+                                    entry_side = "R" if entry_x >= roi_center_x else "L"
+                                    exit_side = "R" if cx >= roi_center_x else "L"
+                                    dbg_text = f"E:{entry_side}->X:{exit_side}"
+                            if dbg_text:
+                                cv2.putText(frame, dbg_text, (x1_full, min(frame.shape[0]-6, y2_full + 18)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 220, 100), 2)
+                        except Exception:
+                            pass
 
-                        state["last_centroid"] = (cx, cy)
-                        self.last_seen[track_id] = self.frame_index
-
-                        if inside_roi and not state["inside_roi"]:
-                            state["inside_roi"] = True
-                            state["entry_x"] = cx
-                        elif not inside_roi and state["inside_roi"] and state["entry_x"] is not None:
-                            entry_x = float(state["entry_x"])
-                            if cx < entry_x:
-                                sbarco_delta += 1
-                                last_direction = "Sbarco"
-                            else:
-                                imbarco_delta += 1
-                                last_direction = "Imbarco"
-                            state["inside_roi"] = False
-                            state["entry_x"] = None
-
-                    cv2.rectangle(frame, (x1_full, y1_full), (x2_full, y2_full), box_color, 2)
-                    cv2.circle(frame, (cx, cy), 3, box_color, -1)
-
-                    label_text = label
-                    if confidence is not None:
-                        label_text = f"{label} {float(confidence):.2f}"
-                    cv2.putText(
-                        frame,
-                        label_text,
-                        (x1_full, max(20, y1_full - 8)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.55,
-                        (235, 245, 255),
-                        2,
-                    )
-
-                    # Debug overlay: show entry/exit side near the box
-                    try:
-                        state_dbg = self.track_states.get(track_id)
-                        dbg_text = ""
-                        if state_dbg is not None:
-                            entry_x = state_dbg.get("entry_x")
-                            if entry_x is not None and roi_center_x is not None:
-                                entry_side = "R" if entry_x >= roi_center_x else "L"
-                                exit_side = "R" if cx >= roi_center_x else "L"
-                                dbg_text = f"E:{entry_side}->X:{exit_side}"
-                        if dbg_text:
-                            cv2.putText(frame, dbg_text, (x1_full, min(frame.shape[0]-6, y2_full + 18)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 220, 100), 2)
-                    except Exception:
-                        pass
 
         stale_ids = [
             track_id
@@ -264,22 +357,33 @@ class RallaTracker:
             self.track_states.pop(track_id, None)
 
         with self.lock:
-            if imbarco_delta or sbarco_delta or last_direction:
-                self.imbarcati += imbarco_delta
-                self.sbarcati += sbarco_delta
-                if last_direction:
-                    self.last_direction = last_direction
+            if self.mode == "dpi":
+                self.current_con_dpi = con_dpi_count
+                self.current_senza_dpi = senza_dpi_count
+            else:
+                if imbarco_delta or sbarco_delta or last_direction:
+                    self.imbarcati += imbarco_delta
+                    self.sbarcati += sbarco_delta
+                    if last_direction:
+                        self.last_direction = last_direction
 
             self.fps = 1.0 / elapsed
             self.last_detection_count = detections_in_roi
             self.active_tracks = active_tracks
-            display_imbarcati = self.imbarcati
-            display_sbarcati = self.sbarcati
-            display_total = self.imbarcati + self.sbarcati
-            display_direction = self.last_direction
             display_fps = self.fps
             display_detections = self.last_detection_count
             display_tracks = self.active_tracks
+            
+            if self.mode == "dpi":
+                display_imbarcati = self.current_con_dpi
+                display_sbarcati = self.current_senza_dpi
+                display_total = self.current_con_dpi + self.current_senza_dpi
+                display_direction = "N/A"
+            else:
+                display_imbarcati = self.imbarcati
+                display_sbarcati = self.sbarcati
+                display_total = self.imbarcati + self.sbarcati
+                display_direction = self.last_direction
 
         self._draw_overlay(
             frame,
@@ -328,10 +432,16 @@ class RallaTracker:
         panel_w, panel_h = 430, 124
         cv2.rectangle(frame, (panel_x, panel_y), (panel_x + panel_w, panel_y + panel_h), (18, 20, 26), -1)
 
-        cv2.putText(frame, f"Imbarcati: {imbarcati}", (panel_x + 12, panel_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (236, 243, 255), 2)
-        cv2.putText(frame, f"Sbarcati: {sbarcati}", (panel_x + 12, panel_y + 58), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (236, 243, 255), 2)
-        cv2.putText(frame, f"Totale: {totale}", (panel_x + 12, panel_y + 86), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (236, 243, 255), 2)
-        cv2.putText(frame, f"Ultima: {last_direction}", (panel_x + 12, panel_y + 112), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (120, 214, 255), 2)
+        if self.mode == "dpi":
+            cv2.putText(frame, f"Con DPI (OK): {imbarcati}", (panel_x + 12, panel_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 0), 2)
+            cv2.putText(frame, f"Senza DPI (NO): {sbarcati}", (panel_x + 12, panel_y + 58), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            cv2.putText(frame, f"Totale in Frame: {totale}", (panel_x + 12, panel_y + 86), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (236, 243, 255), 2)
+            cv2.putText(frame, f"Mode: {self.mode.upper()}", (panel_x + 12, panel_y + 112), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (120, 214, 255), 2)
+        else:
+            cv2.putText(frame, f"Imbarcati: {imbarcati}", (panel_x + 12, panel_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (236, 243, 255), 2)
+            cv2.putText(frame, f"Sbarcati: {sbarcati}", (panel_x + 12, panel_y + 58), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (236, 243, 255), 2)
+            cv2.putText(frame, f"Totale: {totale}", (panel_x + 12, panel_y + 86), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (236, 243, 255), 2)
+            cv2.putText(frame, f"Ultima: {last_direction}", (panel_x + 12, panel_y + 112), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (120, 214, 255), 2)
 
         status_x = max(12, frame.shape[1] - 300)
         status_y = 18

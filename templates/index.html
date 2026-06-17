@@ -53,12 +53,20 @@
                     <p class="text-xs uppercase tracking-[0.3em] text-slate-400">Ro-Ro Terminal</p>
                     <h1 class="text-3xl font-semibold text-white">Ops Monitoring Dashboard</h1>
                 </div>
-                <div class="flex items-center gap-3 rounded-full bg-panel/70 px-4 py-2 text-sm text-slate-200">
-                    <span class="relative flex h-2.5 w-2.5">
-                        <span class="absolute inline-flex h-full w-full animate-ping rounded-full bg-signal/60"></span>
-                        <span class="relative inline-flex h-2.5 w-2.5 rounded-full bg-signal"></span>
-                    </span>
-                    <span>Live processing</span>
+                <div class="flex flex-wrap items-center gap-4">
+                    <div class="flex items-center gap-2">
+                        <label for="config-select" class="text-xs uppercase tracking-[0.1em] text-slate-400">Seleziona Feed:</label>
+                        <select id="config-select" class="rounded-xl border border-white/10 bg-panel px-3 py-1.5 text-sm text-slate-200 focus:border-accent focus:outline-none">
+                            <!-- Populated dynamically -->
+                        </select>
+                    </div>
+                    <div class="flex items-center gap-3 rounded-full bg-panel/70 px-4 py-2 text-sm text-slate-200">
+                        <span class="relative flex h-2.5 w-2.5">
+                            <span class="absolute inline-flex h-full w-full animate-ping rounded-full bg-signal/60"></span>
+                            <span class="relative inline-flex h-2.5 w-2.5 rounded-full bg-signal"></span>
+                        </span>
+                        <span>Live processing</span>
+                    </div>
                 </div>
             </header>
 
@@ -83,22 +91,29 @@
 
                 <div class="flex flex-col gap-4">
                     <div class="rounded-3xl border border-white/10 bg-panel/70 p-5 shadow-xl">
-                        <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Imbarcati</p>
+                        <p id="label-imbarcati" class="text-sm uppercase tracking-[0.25em] text-slate-400">Imbarcati</p>
                         <p id="kpi-imbarcati" class="mt-3 text-4xl font-semibold text-white">0</p>
                         <p class="mt-2 text-xs text-slate-400">Movimenti verso la nave</p>
                     </div>
                     <div class="rounded-3xl border border-white/10 bg-panel/70 p-5 shadow-xl">
-                        <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Sbarcati</p>
+                        <p id="label-sbarcati" class="text-sm uppercase tracking-[0.25em] text-slate-400">Sbarcati</p>
                         <p id="kpi-sbarcati" class="mt-3 text-4xl font-semibold text-white">0</p>
                         <p class="mt-2 text-xs text-slate-400">Movimenti verso il piazzale</p>
                     </div>
                     <div class="rounded-3xl border border-white/10 bg-panel/70 p-5 shadow-xl">
-                        <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Ultima direzione</p>
+                        <p id="label-direzione" class="text-sm uppercase tracking-[0.25em] text-slate-400">Ultima direzione</p>
                         <p id="kpi-direzione" class="mt-3 text-2xl font-semibold text-accent">N/D</p>
                         <div class="mt-4 flex items-center justify-between text-xs text-slate-400">
-                            <span>Totale movimentati</span>
+                            <span id="label-totale">Totale movimentati</span>
                             <span id="kpi-totale" class="font-mono text-slate-200">0</span>
                         </div>
+                    </div>
+
+                    <div class="rounded-3xl border border-white/10 bg-panel/70 p-5 shadow-xl">
+                        <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Azioni</p>
+                        <button id="btn-reset" class="mt-4 w-full rounded-2xl bg-rose-500/10 border border-rose-500/25 text-rose-300 hover:bg-rose-500/25 py-2.5 text-sm font-semibold tracking-wide transition-all active:scale-[0.98]">
+                            Reset Statistiche & Video
+                        </button>
                     </div>
 
                     <div class="rounded-3xl border border-white/10 bg-panel/50 p-5 text-sm text-slate-300">
@@ -120,15 +135,88 @@
             const kpiDirezione = document.getElementById("kpi-direzione");
             const kpiTotale = document.getElementById("kpi-totale");
             const apiStatus = document.getElementById("api-status");
+            const labelImbarcati = document.getElementById("label-imbarcati");
+            const labelSbarcati = document.getElementById("label-sbarcati");
+            const labelDirezione = document.getElementById("label-direzione");
+            const labelTotale = document.getElementById("label-totale");
+            const configSelect = document.getElementById("config-select");
+            const videoStream = document.getElementById("video-stream");
+            const btnReset = document.getElementById("btn-reset");
+
+            let currentConfig = localStorage.getItem("ops_monitor_config") || "sbarco_exit";
+
+            async function loadConfigs() {
+                try {
+                    const response = await fetch("/api/configs");
+                    const configs = await response.json();
+                    
+                    configSelect.innerHTML = "";
+                    for (const [key, name] of Object.entries(configs)) {
+                        const opt = document.createElement("option");
+                        opt.value = key;
+                        opt.textContent = name;
+                        if (key === currentConfig) {
+                            opt.selected = true;
+                        }
+                        configSelect.appendChild(opt);
+                    }
+                    
+                    updateStream();
+                } catch (e) {
+                    console.error("Errore caricamento configurazioni:", e);
+                }
+            }
+
+            function updateStream() {
+                videoStream.src = `/video_feed?config=${currentConfig}&t=${Date.now()}`;
+                refreshStats();
+            }
+
+            configSelect.addEventListener("change", (e) => {
+                currentConfig = e.target.value;
+                localStorage.setItem("ops_monitor_config", currentConfig);
+                updateStream();
+            });
+
+            btnReset.addEventListener("click", async () => {
+                btnReset.disabled = true;
+                btnReset.textContent = "Reset in corso...";
+                try {
+                    await fetch(`/api/reset?config=${currentConfig}`);
+                    refreshStats();
+                } catch (e) {
+                    console.error("Errore durante il reset:", e);
+                } finally {
+                    btnReset.disabled = false;
+                    btnReset.textContent = "Reset Statistiche & Video";
+                }
+            });
 
             async function refreshStats() {
                 try {
-                    const response = await fetch("/api/stats", { cache: "no-store" });
+                    const response = await fetch(`/api/stats?config=${currentConfig}`, { cache: "no-store" });
                     const data = await response.json();
-                    kpiImbarcati.textContent = data.imbarcati ?? 0;
-                    kpiSbarcati.textContent = data.sbarcati ?? 0;
-                    kpiTotale.textContent = data.totale_movimentati ?? 0;
-                    kpiDirezione.textContent = data.ultima_direzione ?? "N/D";
+                    
+                    if (data.mode === "dpi") {
+                        labelImbarcati.textContent = "Con DPI (OK)";
+                        labelSbarcati.textContent = "Senza DPI (NO)";
+                        labelDirezione.textContent = "Modalità";
+                        labelTotale.textContent = "Totale in Frame";
+                        kpiImbarcati.textContent = data.con_dpi ?? 0;
+                        kpiSbarcati.textContent = data.senza_dpi ?? 0;
+                        kpiTotale.textContent = data.totale ?? 0;
+                        kpiDirezione.textContent = "DPI";
+                    } else {
+                        labelImbarcati.textContent = "Imbarcati";
+                        labelSbarcati.textContent = "Sbarcati";
+                        labelDirezione.textContent = "Ultima direzione";
+                        labelTotale.textContent = "Totale movimentati";
+                        kpiImbarcati.textContent = data.imbarcati ?? 0;
+                        kpiSbarcati.textContent = data.sbarcati ?? 0;
+                        kpiTotale.textContent = data.totale_movimentati ?? 0;
+                        kpiDirezione.textContent = data.ultima_direzione ?? "N/D";
+                    }
+                    
                     apiStatus.textContent = "Online";
                     apiStatus.classList.remove("text-rose-300");
                     apiStatus.classList.add("text-emerald-300");
@@ -139,7 +227,7 @@
                 }
             }
 
-            refreshStats();
+            loadConfigs();
             setInterval(refreshStats, 1000);
         </script>
     </body>

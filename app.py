@@ -2,60 +2,120 @@ import os
 import json
 
 import cv2
-from flask import Flask, Response, jsonify, render_template
+from flask import Flask, Response, jsonify, render_template, request
+import threading
 
 from tracker import RallaTracker
 
-VIDEO_PATH = os.environ.get("VIDEO_PATH", "res/Export 01-06-2026 10-18-50.MP4")
-MODEL_PATH = os.environ.get("YOLO_MODEL", "yolov8n.pt")
-RALLA_CLASS_ID = int(os.environ.get("RALLA_CLASS_ID", "2"))
-LINE_RATIO = float(os.environ.get("LINE_RATIO", "0.5"))
-CONFIDENCE = float(os.environ.get("CONFIDENCE", "0.20"))
-IMGSZ = int(os.environ.get("IMGSZ", "256 "))#da 416 default a 256 per performance migliore, ma se si vuole più precisione meglio 416 o 640  
-FRAME_STRIDE = int(os.environ.get("FRAME_STRIDE", "6"))#2 = default, metto 4 per performance migliore
-
-DEFAULT_ROI_POLYGON = [
-    (0.50, 0.50),
-    (0.71, 0.45),
-    (0.77, 0.63),
-    (0.57, 0.69),
-]
-
-ROI_POLYGON = DEFAULT_ROI_POLYGON
-roi_polygon_raw = os.environ.get("ROI_POLYGON", "")
-if roi_polygon_raw.strip():
-    try:
-        ROI_POLYGON = json.loads(roi_polygon_raw)
-    except json.JSONDecodeError:
-        ROI_POLYGON = DEFAULT_ROI_POLYGON
-
-ROTATION_ANGLE = os.environ.get("ROTATION_ANGLE", "-45")
-if ROTATION_ANGLE is not None and ROTATION_ANGLE != "":
-    try:
-        ROTATION_ANGLE = float(ROTATION_ANGLE)
-    except ValueError:
-        ROTATION_ANGLE = -45.0
-else:
-    ROTATION_ANGLE = -45.0
-
-AUTO_ROTATE = os.environ.get("AUTO_ROTATE", "false").lower() in ("1", "true", "yes")
-
 app = Flask(__name__)
-tracker = RallaTracker(
-    video_path=VIDEO_PATH,
-    model_path=MODEL_PATH,
-    ralla_class_id=RALLA_CLASS_ID,
-    line_ratio=LINE_RATIO,
-    conf=CONFIDENCE,
-    imgsz=IMGSZ,
-    rotation_angle=ROTATION_ANGLE,
-    auto_rotate=AUTO_ROTATE,
-    frame_stride=FRAME_STRIDE,
-    roi_polygon=ROI_POLYGON,
-)
+
+CONFIGS = {
+    "dpi": {
+        "name": "DPI - Dispositivi Protezione Individuale (DPI_video.mp4)",
+        "video_path": "res/DPI_video.mp4",
+        "model_path": "yolov8s-world.pt",
+        "mode": "dpi",
+        "ralla_class_id": 0,
+        "line_ratio": 0.5,
+        "conf": 0.20,
+        "imgsz": 416,
+        "rotation_angle": 0.0,
+        "auto_rotate": False,
+        "frame_stride": 3,
+        "roi_polygon": None,
+        "world_classes": ["person", "yellow vest"],
+    },
+    "sbarco_exit": {
+        "name": "Sbarco/Imbarco - Uscita (exit.mp4)",
+        "video_path": "res/exit.mp4",
+        "model_path": "yolov8n.pt",
+        "mode": "tugs",
+        "ralla_class_id": 2,
+        "line_ratio": 0.5,
+        "conf": 0.20,
+        "imgsz": 256,
+        "rotation_angle": -45.0,
+        "auto_rotate": False,
+        "frame_stride": 6,
+        "roi_polygon": [
+            (0.50, 0.50),
+            (0.71, 0.45),
+            (0.77, 0.63),
+            (0.57, 0.69),
+        ],
+        "world_classes": None,
+    },
+    "sbarco_entry": {
+        "name": "Sbarco/Imbarco - Ingresso (entry.mp4)",
+        "video_path": "res/entry.mp4",
+        "model_path": "yolov8n.pt",
+        "mode": "tugs",
+        "ralla_class_id": 2,
+        "line_ratio": 0.5,
+        "conf": 0.20,
+        "imgsz": 256,
+        "rotation_angle": -45.0,
+        "auto_rotate": False,
+        "frame_stride": 6,
+        "roi_polygon": [
+            (0.50, 0.50),
+            (0.71, 0.45),
+            (0.77, 0.63),
+            (0.57, 0.69),
+        ],
+        "world_classes": None,
+    },
+    "sbarco_export": {
+        "name": "Sbarco/Imbarco - Export Completo",
+        "video_path": "res/Export 01-06-2026 10-18-50.MP4",
+        "model_path": "yolov8n.pt",
+        "mode": "tugs",
+        "ralla_class_id": 2,
+        "line_ratio": 0.5,
+        "conf": 0.20,
+        "imgsz": 256,
+        "rotation_angle": -45.0,
+        "auto_rotate": False,
+        "frame_stride": 6,
+        "roi_polygon": [
+            (0.50, 0.50),
+            (0.71, 0.45),
+            (0.77, 0.63),
+            (0.57, 0.69),
+        ],
+        "world_classes": None,
+    }
+}
+
+trackers = {}
+trackers_lock = threading.Lock()
+
+def get_tracker(config_key):
+    if config_key not in CONFIGS:
+        config_key = "sbarco_exit"
+    
+    with trackers_lock:
+        if config_key not in trackers:
+            cfg = CONFIGS[config_key]
+            trackers[config_key] = RallaTracker(
+                video_path=cfg["video_path"],
+                model_path=cfg["model_path"],
+                ralla_class_id=cfg["ralla_class_id"],
+                line_ratio=cfg["line_ratio"],
+                conf=cfg["conf"],
+                imgsz=cfg["imgsz"],
+                rotation_angle=cfg["rotation_angle"],
+                auto_rotate=cfg["auto_rotate"],
+                frame_stride=cfg["frame_stride"],
+                roi_polygon=cfg["roi_polygon"],
+                mode=cfg["mode"],
+                world_classes=cfg["world_classes"],
+            )
+        return trackers[config_key]
 
 
-def generate_frames():
+def generate_frames(config_key):
+    tracker = get_tracker(config_key)
     while True:
         frame = tracker.process_next_frame()
         if frame is None:
@@ -78,15 +138,31 @@ def index():
 
 @app.route("/video_feed")
 def video_feed():
+    config_key = request.args.get("config", "sbarco_exit")
     return Response(
-        generate_frames(),
+        generate_frames(config_key),
         mimetype="multipart/x-mixed-replace; boundary=frame",
     )
 
 
 @app.route("/api/stats")
 def stats():
+    config_key = request.args.get("config", "sbarco_exit")
+    tracker = get_tracker(config_key)
     return jsonify(tracker.get_stats())
+
+
+@app.route("/api/configs")
+def get_configs():
+    return jsonify({k: v["name"] for k, v in CONFIGS.items()})
+
+
+@app.route("/api/reset")
+def reset_tracker():
+    config_key = request.args.get("config", "sbarco_exit")
+    tracker = get_tracker(config_key)
+    tracker.reset_counters()
+    return jsonify({"status": "ok", "stats": tracker.get_stats()})
 
 
 if __name__ == "__main__":
