@@ -175,6 +175,9 @@ venv.bak/
 .dmypy.json
 dmypy.json
 
+# YOLO models
+*.pt
+
 # Pyre type checker
 .pyre/
 
